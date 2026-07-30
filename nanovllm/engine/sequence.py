@@ -58,6 +58,9 @@ class Sequence:
 
     @property
     def last_block_num_tokens(self):
+        # 【修复】block_table 为空时返回 0
+        if not self.block_table:
+            return 0
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
     def block(self, i):

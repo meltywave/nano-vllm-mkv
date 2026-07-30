@@ -1,4 +1,5 @@
 import atexit
+import logging
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -11,6 +12,8 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
+logger = logging.getLogger("llm_engine")
+
 
 class LLMEngine:
 
@@ -18,6 +21,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -32,6 +36,8 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.scheduler.set_model_runner(self.model_runner)
+        self.block_manager = self.scheduler.block_manager
         atexit.register(self.exit)
 
     def exit(self):
@@ -48,6 +54,12 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        
+        # 处理死锁情况
+        if not seqs:
+            logger.warning("[LLMEngine] Scheduler返回空序列，可能死锁，强制结束")
+            return [], 0
+        
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
@@ -75,7 +87,7 @@ class LLMEngine:
             output, num_tokens = self.step()
             if num_tokens > 0:
                 prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
+            elif num_tokens < 0:
                 decode_throughput = -num_tokens / (perf_counter() - t)
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
@@ -85,6 +97,13 @@ class LLMEngine:
                 outputs[seq_id] = token_ids
                 pbar.update(1)
         pbar.close()
+
+        # 推理结束打印远端Swap全套统计
+        if self.config.enable_remote_swap:
+            print("\n" + "=" * 60)
+            print("推理任务结束，远端KV Swap性能统计：")
+            self.block_manager.print_swap_statistics()
+
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         return outputs

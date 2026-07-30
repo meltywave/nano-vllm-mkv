@@ -11,6 +11,9 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
+import logging
+logger = logging.getLogger("model_runner")
+
 
 class ModelRunner:
 
@@ -23,15 +26,32 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        # ========= 修改：分布式初始化挪到模型创建之前，单卡也强制初始化 =========
+        # Qwen3 的 VocabParallelEmbedding 内部会调用 dist.get_rank()，必须先初始化进程组
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
+
+        # ========= 兼容 Qwen2/Qwen3 的 dtype 字段（保留，Qwen3 走第一个分支） =========
+        if hasattr(hf_config, "dtype"):
+            self.model_dtype = hf_config.dtype
+        elif hasattr(hf_config, "torch_dtype"):
+            str_dtype = str(hf_config.torch_dtype)
+            if "bfloat16" in str_dtype:
+                self.model_dtype = torch.bfloat16
+            elif "float16" in str_dtype:
+                self.model_dtype = torch.float16
+            else:
+                self.model_dtype = torch.float32
+        else:
+            self.model_dtype = torch.bfloat16
+
+        torch.set_default_dtype(self.model_dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
-        self.warmup_model()
+        #self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -56,6 +76,7 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
+        # ========= 修改：单卡也执行销毁，因为上面已经初始化了 =========
         dist.destroy_process_group()
 
     def loop(self):
@@ -109,8 +130,12 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.model_dtype.itemsize
+        
+        # 【修改】只在用户未指定时自动计算，否则使用用户指定值
+        if config.num_kvcache_blocks == -1:
+            config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
@@ -121,8 +146,13 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        # 过滤掉 block_table 为空的序列
+        valid_seqs = [seq for seq in seqs if seq.block_table]
+        if not valid_seqs:
+            return torch.tensor([], dtype=torch.int32)
+        
+        max_len = max(len(seq.block_table) for seq in valid_seqs)
+        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in valid_seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
@@ -135,7 +165,18 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        
         for seq in seqs:
+            # 【关键保护】如果 block_table 为空，跳过这个序列
+            if not seq.block_table:
+                logger.warning(f"[ModelRunner] 序列 {seq.seq_id} block_table 为空，跳过 prefill")
+                continue
+            
+            # 【检查】block_table 是否足够覆盖所有 token
+            if seq.num_cached_tokens + seq.num_scheduled_tokens > len(seq.block_table) * self.block_size:
+                logger.warning(f"[ModelRunner] 序列 {seq.seq_id} block_table 不足 (need={seq.num_cached_tokens + seq.num_scheduled_tokens}, have={len(seq.block_table) * self.block_size})，跳过 prefill")
+                continue
+            
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
@@ -146,10 +187,11 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
-                continue
+            
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
+            # 【修复】确保 end_block 不超过 block_table 的长度
+            end_block = min(end_block, len(seq.block_table))
             for i in range(start_block, end_block):
                 slot_start = seq.block_table[i] * self.block_size
                 if i == start_block:
@@ -159,8 +201,15 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
+        
+        # 如果没有有效数据，返回空张量
+        if not input_ids:
+            logger.warning("[ModelRunner] prepare_prefill: 没有有效输入")
+            return torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=torch.int64)
+        
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+        
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -174,11 +223,23 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        
         for seq in seqs:
+            # 【关键保护】如果 block_table 为空，跳过
+            if not seq.block_table:
+                logger.warning(f"[ModelRunner] 序列 {seq.seq_id} block_table 为空，跳过 decode")
+                continue
+            
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+        
+        # 如果没有有效数据，返回空张量
+        if not input_ids:
+            logger.warning("[ModelRunner] prepare_decode: 没有有效输入")
+            return torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=torch.int64)
+        
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -188,7 +249,11 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = [seq.temperature for seq in seqs]
+        # 只取有 block_table 的序列
+        valid_seqs = [seq for seq in seqs if seq.block_table]
+        if not valid_seqs:
+            return torch.tensor([], dtype=torch.float32)
+        temperatures = [seq.temperature for seq in valid_seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
@@ -213,7 +278,14 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        
+        if input_ids.numel() == 0:
+            logger.warning("[ModelRunner] run: 没有有效输入，返回空列表")
+            return []
+        
+        # 只取有效序列
+        valid_seqs = [seq for seq in seqs if seq.block_table]
+        temperatures = self.prepare_sample(valid_seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
@@ -255,3 +327,16 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+    # ===================== 新增：远端Swap配套接口 =====================
+    def extract_block(self, block_id: int) -> torch.Tensor:
+        """取出指定block完整KV张量（K+V），返回独立clone"""
+        return self.kv_cache[:, :, block_id, :, :, :].clone()
+
+    def restore_block(self, block_id: int, block_tensor: torch.Tensor):
+        """将远端拉回的KV张量写回缓存对应位置"""
+        self.kv_cache[:, :, block_id, :, :, :].copy_(block_tensor)
+
+    def clear_block(self, block_id: int):
+        """逻辑清空block数据（原型阶段占位，显存不回收）"""
+        self.kv_cache[:, :, block_id, :, :, :].zero_()
