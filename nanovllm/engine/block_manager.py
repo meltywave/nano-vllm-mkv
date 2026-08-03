@@ -25,12 +25,14 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int,num_cpu_blocks: int = 0):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        self.cpu_blocks = [Block(i) for i in range(num_cpu_blocks)]
+        self.free_cpu_block_ids = deque(range(num_cpu_blocks))
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -118,3 +120,56 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+
+    def can_swap_out(self, seq):
+        return len(self.free_cpu_block_ids) >= seq.num_blocks
+
+    def swap_out(self, seq):
+        gpu_table = seq.block_table
+        cpu_table = []
+        mappings = []
+        for gpu_id in gpu_table:
+            cpu_id = self.free_cpu_block_ids.popleft()
+            src, dst = self.blocks[gpu_id], self.cpu_blocks[cpu_id]
+            assert dst.ref_count == 0
+            dst.ref_count = 1
+            dst.update(src.hash, list(src.token_ids))
+            cpu_table.append(cpu_id)
+            mappings.append((gpu_id, cpu_id))
+
+        for gpu_id in reversed(gpu_table):
+            block = self.blocks[gpu_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(gpu_id)
+
+        seq.block_table = cpu_table
+        return mappings
+
+    def can_swap_in(self, seq, extra_gpu_blocks=0):
+        return len(self.free_block_ids) >= len(seq.block_table) + extra_gpu_blocks
+
+    def swap_in(self, seq):
+        cpu_table = seq.block_table
+        gpu_table = []
+        mappings = []
+
+        for cpu_id in cpu_table:
+            cpu_block = self.cpu_blocks[cpu_id]
+            gpu_id = self._allocate_block()
+            gpu_block = self.blocks[gpu_id]
+            gpu_block.update(cpu_block.hash, list(cpu_block.token_ids))
+            if gpu_block.hash != -1:
+                self.hash_to_block_id[gpu_block.hash] = gpu_id
+            gpu_table.append(gpu_id)
+            mappings.append((cpu_id, gpu_id))
+
+        for cpu_id in cpu_table:
+            block = self.cpu_blocks[cpu_id]
+            block.ref_count = 0
+            block.hash = -1
+            block.token_ids = []
+            self.free_cpu_block_ids.append(cpu_id)
+
+        seq.block_table = gpu_table
+        return mappings

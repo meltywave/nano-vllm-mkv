@@ -107,18 +107,84 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_block_bytes = block_bytes
+
+        profiled_gpu_blocks = (
+            int((total * config.gpu_memory_utilization - used - peak + current) // block_bytes)
+        )
+
+        if config.num_kvcache_blocks > 0:
+            num_gpu_blocks = min(config.num_kvcache_blocks, profiled_gpu_blocks)
+        else:
+            num_gpu_blocks = profiled_gpu_blocks
+
+        if self.world_size > 1:
+            count = torch.tensor(num_gpu_blocks, dtype=torch.int64, device="cuda")
+            dist.all_reduce(count, op=dist.ReduceOp.MIN)
+            num_gpu_blocks = int(count.item())
+        if num_gpu_blocks <= 0:
+            raise RuntimeError(
+                f"Not enough GPU memory for KV cache. "
+            )
+        config.num_kvcache_blocks = num_gpu_blocks
+
+        if config.num_cpu_kvcache_blocks >= 0:
+            num_cpu_blocks = config.num_cpu_kvcache_blocks
+        else:
+            cpu_bytes_per_rank = int(
+                config.cpu_kvcache_gb * 1024**3 / self.world_size
+            )
+            num_cpu_blocks = cpu_bytes_per_rank // block_bytes
+
+        if config.cpu_kvcache_gb > 0 and num_cpu_blocks == 0:
+            raise RuntimeError(
+                f"cpu_kvcache_gb is smaller than one logical KV block. "
+            )
+        config.num_cpu_kvcache_blocks = num_cpu_blocks
+
+        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, num_gpu_blocks, self.block_size, num_kv_heads, head_dim, dtype=hf_config.dtype, device="cuda")
+
+        self.cpu_kv_cache = None
+        if num_cpu_blocks > 0:
+            self.cpu_kv_cache = torch.empty(2, hf_config.num_hidden_layers, num_cpu_blocks, self.block_size, num_kv_heads, head_dim, dtype=hf_config.dtype, device="cpu", pin_memory=True)
+        self.swap_stream = torch.cuda.Stream()
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+
+    @torch.inference_mode()
+    def swap_blocks(self, blocks_to_swap_in, blocks_to_swap_out):
+        if not blocks_to_swap_in and not blocks_to_swap_out:
+            return
+        if blocks_to_swap_in and blocks_to_swap_out:
+            raise RuntimeError("Cannot swap in and out at the same time.")
+        if self.cpu_kv_cache is None:
+            raise RuntimeError("CPU KV cache is not allocated.")
+
+        current_stream = torch.cuda.current_stream()
+        self.swap_stream.wait_stream(current_stream)
+
+        gpu_layer_caches = self.kv_cache.flatten(0,1)
+        cpu_layer_caches = self.cpu_kv_cache.flatten(0,1)
+
+        with torch.cuda.stream(self.swap_stream):
+            for gpu_block_id, cpu_block_id in blocks_to_swap_out:
+                for gpu_cache, cpu_cache in zip(gpu_layer_caches, cpu_layer_caches):
+                    cpu_cache[cpu_block_id].copy_(gpu_cache[gpu_block_id], non_blocking=True)
+
+            for cpu_block_id, gpu_block_id in blocks_to_swap_in:
+                for gpu_cache, cpu_cache in zip(gpu_layer_caches, cpu_layer_caches):
+                    gpu_cache[gpu_block_id].copy_(cpu_cache[cpu_block_id], non_blocking=True)
+
+        self.swap_stream.synchronize()
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -211,11 +277,24 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    def run(self, seqs: list[Sequence], is_prefill: bool, blocks_to_swap_in=None, blocks_to_swap_out=None) -> list[int]:
+        self.swap_blocks(blocks_to_swap_in or [], blocks_to_swap_out or [])
+
+        if not seqs:
+            return []
+
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
+
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = (
+            self.sampler(logits, temperatures).tolist()
+            if self.rank == 0
+            else None
+        )
         reset_context()
         return token_ids
 
