@@ -22,16 +22,65 @@ class LLMEngine:
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
+
+        # 选择 ModelRunner 类
+        enable_multilevel = getattr(config, "enable_multilevel_kvcache", False) and getattr(config, "cpu_num_kvcache_blocks", 0) > 0
+
+        if enable_multilevel:
+            from nanovllm.engine.multi_level_model_runner import MultiLevelModelRunner
+            ModelRunnerClass = MultiLevelModelRunner
+            print(f"[LLMEngine] Using MultiLevelModelRunner")
+        else:
+            from nanovllm.engine.model_runner import ModelRunner
+            ModelRunnerClass = ModelRunner
+
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process = ctx.Process(target=ModelRunnerClass, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+
+        self.model_runner = ModelRunnerClass(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
+
+        # 根据配置选择调度器
+        if enable_multilevel:
+            from nanovllm.engine.multi_level_scheduler import MultiLevelScheduler
+            self.scheduler = MultiLevelScheduler(config)
+            print(f"[LLMEngine] Using MultiLevelScheduler with {config.cpu_num_kvcache_blocks} CPU blocks")
+
+            # 将块管理器传递给 model_runner
+            if hasattr(self.model_runner, 'set_block_manager'):
+                self.model_runner.set_block_manager(self.scheduler.block_manager)
+
+            # 初始化磁盘存储（如果启用了磁盘缓存）
+            if getattr(config, "enable_disk_cache", False) and getattr(config, "disk_num_kvcache_blocks", 0) > 0:
+                hf_config = config.hf_config
+                num_kv_heads = hf_config.num_key_value_heads // config.tensor_parallel_size
+                head_dim = getattr(
+                    hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads
+                )
+                block_shape = (
+                    2,  # K and V
+                    hf_config.num_hidden_layers,
+                    config.kvcache_block_size,
+                    num_kv_heads,
+                    head_dim,
+                )
+                # 从 model_runner 获取 dtype
+                dtype = self.model_runner.kv_cache.dtype
+                self.scheduler.block_manager.init_disk_store(
+                    cache_dir=getattr(config, "disk_cache_dir", "./kv_disk_cache"),
+                    block_shape=block_shape,
+                    dtype=dtype,
+                )
+                print(f"[LLMEngine] Disk cache initialized: {config.disk_num_kvcache_blocks} blocks")
+        else:
+            self.scheduler = Scheduler(config)
+            print(f"[LLMEngine] Using standard Scheduler")
+
         atexit.register(self.exit)
 
     def exit(self):
