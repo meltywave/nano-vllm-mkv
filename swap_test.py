@@ -118,9 +118,9 @@ def main():
     assert scheduler_cpu_blocks == 16, (f"Expected 16 scheduler CPU KV cache blocks, got {scheduler_cpu_blocks}")
 
     sampling_params = SamplingParams(
-        temperature=0.6,
+        temperature=1e-5,
         max_tokens=OUTPUT_TOKENS,
-        ignore_eos=True,
+        ignore_eos=False,
     )
 
     started = perf_counter()
