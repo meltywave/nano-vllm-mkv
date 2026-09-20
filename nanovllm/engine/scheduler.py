@@ -13,6 +13,7 @@ class Scheduler:
             config.kvcache_block_size,
             config.num_cpu_kvcache_blocks,
             config.num_ssd_kvcache_blocks,
+            config.num_remote_kvcache_blocks,
         )
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
@@ -29,6 +30,10 @@ class Scheduler:
         self.num_gpu_to_ssd_blocks = 0
         self.num_cpu_to_gpu_blocks = 0
         self.num_ssd_to_gpu_blocks = 0
+        self.num_gpu_to_remote_blocks = 0
+        self.num_cpu_to_remote_blocks = 0
+        self.num_ssd_to_remote_blocks = 0
+        self.num_remote_to_gpu_blocks = 0
 
     def is_finished(self):
         return not self.waiting and not self.running and not self.swapped
@@ -53,23 +58,50 @@ class Scheduler:
                 self.num_cpu_to_gpu_blocks += 1
             elif (src, dst) == (CacheTier.SSD, CacheTier.GPU):
                 self.num_ssd_to_gpu_blocks += 1
+            elif (src, dst) == (CacheTier.GPU, CacheTier.REMOTE):
+                self.num_gpu_to_remote_blocks += 1
+            elif (src, dst) == (CacheTier.CPU, CacheTier.REMOTE):
+                self.num_cpu_to_remote_blocks += 1
+            elif (src, dst) == (CacheTier.SSD, CacheTier.REMOTE):
+                self.num_ssd_to_remote_blocks += 1
+            elif (src, dst) == (CacheTier.REMOTE, CacheTier.GPU):
+                self.num_remote_to_gpu_blocks += 1
 
-    def _demote_cold_cpu_sequences(self, required_cpu_blocks: int):
+    @staticmethod
+    def _lower_tiers(tier: CacheTier):
+        if tier == CacheTier.CPU:
+            return (CacheTier.SSD, CacheTier.REMOTE)
+        if tier == CacheTier.SSD:
+            return (CacheTier.REMOTE,)
+        return ()
+
+    def _ensure_free_blocks(self, tier: CacheTier, required_blocks: int):
         transfers = []
         block_manager = self.block_manager
-        if block_manager.num_free_blocks(CacheTier.CPU) >= required_cpu_blocks:
+        if block_manager.num_free_blocks(tier) >= required_blocks:
             return transfers
 
         # The right side contains sequences that have waited the longest.
-        for candidate in reversed(self.swapped):
-            if candidate.block_table_tier != CacheTier.CPU:
+        for candidate in tuple(reversed(self.swapped)):
+            if candidate.block_table_tier != tier:
                 continue
-            if not block_manager.can_swap(candidate, CacheTier.SSD):
-                continue
-            mappings = block_manager.swap(candidate, CacheTier.SSD)
-            transfers.extend(mappings)
-            self._record_transfers(mappings)
-            if block_manager.num_free_blocks(CacheTier.CPU) >= required_cpu_blocks:
+            candidate_blocks = len(candidate.block_table)
+
+            for target_tier in self._lower_tiers(tier):
+                if candidate_blocks > block_manager.capacity(target_tier):
+                    continue
+                nested = self._ensure_free_blocks(
+                    target_tier, candidate_blocks
+                )
+                transfers.extend(nested)
+                if not block_manager.can_swap(candidate, target_tier):
+                    continue
+                mappings = block_manager.swap(candidate, target_tier)
+                transfers.extend(mappings)
+                self._record_transfers(mappings)
+                break
+
+            if block_manager.num_free_blocks(tier) >= required_blocks:
                 break
         return transfers
 
@@ -194,15 +226,19 @@ class Scheduler:
         num_blocks = len(seq.block_table)
         mappings = []
 
-        if num_blocks <= block_manager.capacity(CacheTier.CPU):
-            mappings.extend(self._demote_cold_cpu_sequences(num_blocks))
-
-        if block_manager.can_swap_out(seq, CacheTier.CPU):
-            swap_out = block_manager.swap_out(seq, CacheTier.CPU)
-        elif block_manager.can_swap_out(seq, CacheTier.SSD):
-            swap_out = block_manager.swap_out(seq, CacheTier.SSD)
-        else:
-            swap_out = []
+        swap_out = []
+        for target_tier in (
+            CacheTier.CPU,
+            CacheTier.SSD,
+            CacheTier.REMOTE,
+        ):
+            if num_blocks > block_manager.capacity(target_tier):
+                continue
+            demotions = self._ensure_free_blocks(target_tier, num_blocks)
+            mappings.extend(demotions)
+            if block_manager.can_swap_out(seq, target_tier):
+                swap_out = block_manager.swap_out(seq, target_tier)
+                break
 
         if swap_out:
             mappings.extend(swap_out)

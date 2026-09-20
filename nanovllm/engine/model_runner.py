@@ -6,6 +6,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.block_manager import BlockTransfer
+from nanovllm.engine.remote_cache import RemoteCache
 from nanovllm.engine.sequence import CacheTier, Sequence
 from nanovllm.engine.ssd_cache import SSDCache
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
@@ -60,6 +61,8 @@ class ModelRunner:
         torch.cuda.synchronize()
         if self.ssd_kv_cache is not None:
             self.ssd_kv_cache.close()
+        if self.remote_kv_cache is not None:
+            self.remote_kv_cache.close()
         dist.destroy_process_group()
 
     def loop(self):
@@ -164,12 +167,33 @@ class ModelRunner:
             )
         config.num_ssd_kvcache_blocks = num_ssd_blocks
 
+        if config.num_remote_kvcache_blocks >= 0:
+            num_remote_blocks = config.num_remote_kvcache_blocks
+        else:
+            remote_bytes_per_rank = int(
+                config.remote_kvcache_gb * 1024**3 / self.world_size
+            )
+            num_remote_blocks = remote_bytes_per_rank // block_bytes
+
+        if config.remote_kvcache_gb > 0 and num_remote_blocks == 0:
+            raise RuntimeError(
+                "remote_kvcache_gb is smaller than one logical KV block."
+            )
+        config.num_remote_kvcache_blocks = num_remote_blocks
+
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, num_gpu_blocks, self.block_size, num_kv_heads, head_dim, dtype=hf_config.dtype, device="cuda")
 
         self.cpu_kv_cache = None
         if num_cpu_blocks > 0:
             self.cpu_kv_cache = torch.empty(2, hf_config.num_hidden_layers, num_cpu_blocks, self.block_size, num_kv_heads, head_dim, dtype=hf_config.dtype, device="cpu", pin_memory=True)
         self.swap_stream = torch.cuda.Stream()
+        cache_block_shape = (
+            2,
+            hf_config.num_hidden_layers,
+            self.block_size,
+            num_kv_heads,
+            head_dim,
+        )
         self.ssd_kv_cache = None
         if num_ssd_blocks > 0:
             self.ssd_kv_cache = SSDCache(
@@ -177,13 +201,18 @@ class ModelRunner:
                 config.ssd_cache_id,
                 self.rank,
                 num_ssd_blocks,
-                (
-                    2,
-                    hf_config.num_hidden_layers,
-                    self.block_size,
-                    num_kv_heads,
-                    head_dim,
-                ),
+                cache_block_shape,
+                hf_config.dtype,
+            )
+        self.remote_kv_cache = None
+        if num_remote_blocks > 0:
+            self.remote_kv_cache = RemoteCache(
+                config.remote_kvcache_host,
+                config.remote_kvcache_port,
+                config.remote_kvcache_timeout,
+                f"{config.ssd_cache_id}-rank{self.rank}",
+                num_remote_blocks,
+                cache_block_shape,
                 hf_config.dtype,
             )
 
@@ -202,33 +231,53 @@ class ModelRunner:
             if self.cpu_kv_cache is None:
                 raise RuntimeError("CPU KV cache is not allocated.")
             return self.cpu_kv_cache[:, :, block_id]
-        raise ValueError("SSD blocks must be accessed through SSDCache.")
+        raise ValueError(
+            "SSD and remote blocks must be accessed through their backends."
+        )
+
+    def _offload_cache(self, tier: CacheTier):
+        if tier == CacheTier.SSD:
+            cache = self.ssd_kv_cache
+        elif tier == CacheTier.REMOTE:
+            cache = self.remote_kv_cache
+        else:
+            raise ValueError(f"{tier.value} is not an offload cache tier.")
+        if cache is None:
+            raise RuntimeError(f"{tier.value.upper()} KV cache is not allocated.")
+        return cache
 
     def _transfer_block(self, transfer: BlockTransfer):
         src_tier, dst_tier = transfer.src_tier, transfer.dst_tier
-        if CacheTier.SSD in (src_tier, dst_tier):
-            if self.ssd_kv_cache is None:
-                raise RuntimeError("SSD KV cache is not allocated.")
-            # A previous GPU-to-CPU copy may target a CPU block reused here.
-            self.swap_stream.synchronize()
-            if dst_tier == CacheTier.SSD:
-                source = self._cache_block(src_tier, transfer.src_block_id)
-                self.ssd_kv_cache.write_block(
-                    transfer.dst_block_id, source, self.swap_stream
-                )
-            else:
-                destination = self._cache_block(
-                    dst_tier, transfer.dst_block_id
-                )
-                self.ssd_kv_cache.read_block(
-                    transfer.src_block_id, destination, self.swap_stream
-                )
+        offload_tiers = (CacheTier.SSD, CacheTier.REMOTE)
+        if src_tier not in offload_tiers and dst_tier not in offload_tiers:
+            source = self._cache_block(src_tier, transfer.src_block_id)
+            destination = self._cache_block(dst_tier, transfer.dst_block_id)
+            with torch.cuda.stream(self.swap_stream):
+                destination.copy_(source, non_blocking=True)
             return
 
-        source = self._cache_block(src_tier, transfer.src_block_id)
-        destination = self._cache_block(dst_tier, transfer.dst_block_id)
-        with torch.cuda.stream(self.swap_stream):
-            destination.copy_(source, non_blocking=True)
+        # A previous asynchronous local copy may target a block reused here.
+        self.swap_stream.synchronize()
+        if src_tier in offload_tiers and dst_tier in offload_tiers:
+            source_cache = self._offload_cache(src_tier)
+            destination_cache = self._offload_cache(dst_tier)
+            staging = destination_cache.staging
+            source_cache.read_block(
+                transfer.src_block_id, staging, self.swap_stream
+            )
+            destination_cache.write_block(
+                transfer.dst_block_id, staging, self.swap_stream
+            )
+        elif dst_tier in offload_tiers:
+            source = self._cache_block(src_tier, transfer.src_block_id)
+            self._offload_cache(dst_tier).write_block(
+                transfer.dst_block_id, source, self.swap_stream
+            )
+        else:
+            destination = self._cache_block(dst_tier, transfer.dst_block_id)
+            self._offload_cache(src_tier).read_block(
+                transfer.src_block_id, destination, self.swap_stream
+            )
 
     @torch.inference_mode()
     def swap_blocks(self, blocks_to_swap_in, blocks_to_swap_out):

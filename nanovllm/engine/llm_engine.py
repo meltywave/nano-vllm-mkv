@@ -19,6 +19,7 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
         Sequence.block_size = config.kvcache_block_size
+        self._exited = False
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -35,6 +36,9 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        if self._exited:
+            return
+        self._exited = True
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:

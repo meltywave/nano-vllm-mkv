@@ -13,6 +13,9 @@ def main():
         num_cpu_kvcache_blocks=64,
         num_ssd_kvcache_blocks=256,
         ssd_kvcache_path=os.path.expanduser("~/nanovllm-kv-cache"),
+        num_remote_kvcache_blocks=1024,
+        remote_kvcache_host="127.0.0.1",
+        remote_kvcache_port=19090,
         max_model_len=4096,
     )
 

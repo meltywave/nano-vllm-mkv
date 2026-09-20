@@ -40,6 +40,7 @@ class BlockManager:
         block_size: int,
         num_cpu_blocks: int = 0,
         num_ssd_blocks: int = 0,
+        num_remote_blocks: int = 0,
     ):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
@@ -50,6 +51,8 @@ class BlockManager:
         self.free_cpu_block_ids = deque(range(num_cpu_blocks))
         self.ssd_blocks = [Block(i) for i in range(num_ssd_blocks)]
         self.free_ssd_block_ids = deque(range(num_ssd_blocks))
+        self.remote_blocks = [Block(i) for i in range(num_remote_blocks)]
+        self.free_remote_block_ids = deque(range(num_remote_blocks))
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -147,6 +150,8 @@ class BlockManager:
             return self.cpu_blocks
         if tier == CacheTier.SSD:
             return self.ssd_blocks
+        if tier == CacheTier.REMOTE:
+            return self.remote_blocks
         raise ValueError(f"Unknown cache tier: {tier!r}")
 
     def _free_ids_for_tier(self, tier: CacheTier) -> deque[int]:
@@ -156,6 +161,8 @@ class BlockManager:
             return self.free_cpu_block_ids
         if tier == CacheTier.SSD:
             return self.free_ssd_block_ids
+        if tier == CacheTier.REMOTE:
+            return self.free_remote_block_ids
         raise ValueError(f"Unknown cache tier: {tier!r}")
 
     def capacity(self, tier: CacheTier) -> int:

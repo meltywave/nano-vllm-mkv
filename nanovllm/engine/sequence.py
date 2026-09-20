@@ -16,6 +16,7 @@ class CacheTier(Enum):
     GPU = "gpu"
     CPU = "cpu"
     SSD = "ssd"
+    REMOTE = "remote"
 
 
 class Sequence:

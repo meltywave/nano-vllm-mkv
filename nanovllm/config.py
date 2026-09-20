@@ -23,6 +23,11 @@ class Config:
     ssd_kvcache_gb: float = 0.0
     num_ssd_kvcache_blocks: int = -1
     ssd_kvcache_path: str | None = None
+    remote_kvcache_gb: float = 0.0
+    num_remote_kvcache_blocks: int = -1
+    remote_kvcache_host: str = "127.0.0.1"
+    remote_kvcache_port: int = 19090
+    remote_kvcache_timeout: float = 30.0
     ssd_cache_id: str = field(init=False, repr=False)
 
     def __post_init__(self):
@@ -33,6 +38,11 @@ class Config:
         assert self.num_cpu_kvcache_blocks >= -1
         assert self.ssd_kvcache_gb >= 0
         assert self.num_ssd_kvcache_blocks >= -1
+        assert self.remote_kvcache_gb >= 0
+        assert self.num_remote_kvcache_blocks >= -1
+        assert self.remote_kvcache_host
+        assert 1 <= self.remote_kvcache_port <= 65535
+        assert self.remote_kvcache_timeout > 0
         if self.ssd_kvcache_path is None:
             self.ssd_kvcache_path = tempfile.gettempdir()
         self.ssd_kvcache_path = os.path.abspath(
