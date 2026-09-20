@@ -5,7 +5,9 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.block_manager import BlockTransfer
+from nanovllm.engine.sequence import CacheTier, Sequence
+from nanovllm.engine.ssd_cache import SSDCache
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -56,6 +58,8 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
+        if self.ssd_kv_cache is not None:
+            self.ssd_kv_cache.close()
         dist.destroy_process_group()
 
     def loop(self):
@@ -146,12 +150,42 @@ class ModelRunner:
             )
         config.num_cpu_kvcache_blocks = num_cpu_blocks
 
+        if config.num_ssd_kvcache_blocks >= 0:
+            num_ssd_blocks = config.num_ssd_kvcache_blocks
+        else:
+            ssd_bytes_per_rank = int(
+                config.ssd_kvcache_gb * 1024**3 / self.world_size
+            )
+            num_ssd_blocks = ssd_bytes_per_rank // block_bytes
+
+        if config.ssd_kvcache_gb > 0 and num_ssd_blocks == 0:
+            raise RuntimeError(
+                "ssd_kvcache_gb is smaller than one logical KV block."
+            )
+        config.num_ssd_kvcache_blocks = num_ssd_blocks
+
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, num_gpu_blocks, self.block_size, num_kv_heads, head_dim, dtype=hf_config.dtype, device="cuda")
 
         self.cpu_kv_cache = None
         if num_cpu_blocks > 0:
             self.cpu_kv_cache = torch.empty(2, hf_config.num_hidden_layers, num_cpu_blocks, self.block_size, num_kv_heads, head_dim, dtype=hf_config.dtype, device="cpu", pin_memory=True)
         self.swap_stream = torch.cuda.Stream()
+        self.ssd_kv_cache = None
+        if num_ssd_blocks > 0:
+            self.ssd_kv_cache = SSDCache(
+                config.ssd_kvcache_path,
+                config.ssd_cache_id,
+                self.rank,
+                num_ssd_blocks,
+                (
+                    2,
+                    hf_config.num_hidden_layers,
+                    self.block_size,
+                    num_kv_heads,
+                    head_dim,
+                ),
+                hf_config.dtype,
+            )
 
         layer_id = 0
         for module in self.model.modules():
@@ -161,28 +195,53 @@ class ModelRunner:
                 layer_id += 1
 
     @torch.inference_mode()
+    def _cache_block(self, tier: CacheTier, block_id: int):
+        if tier == CacheTier.GPU:
+            return self.kv_cache[:, :, block_id]
+        if tier == CacheTier.CPU:
+            if self.cpu_kv_cache is None:
+                raise RuntimeError("CPU KV cache is not allocated.")
+            return self.cpu_kv_cache[:, :, block_id]
+        raise ValueError("SSD blocks must be accessed through SSDCache.")
+
+    def _transfer_block(self, transfer: BlockTransfer):
+        src_tier, dst_tier = transfer.src_tier, transfer.dst_tier
+        if CacheTier.SSD in (src_tier, dst_tier):
+            if self.ssd_kv_cache is None:
+                raise RuntimeError("SSD KV cache is not allocated.")
+            # A previous GPU-to-CPU copy may target a CPU block reused here.
+            self.swap_stream.synchronize()
+            if dst_tier == CacheTier.SSD:
+                source = self._cache_block(src_tier, transfer.src_block_id)
+                self.ssd_kv_cache.write_block(
+                    transfer.dst_block_id, source, self.swap_stream
+                )
+            else:
+                destination = self._cache_block(
+                    dst_tier, transfer.dst_block_id
+                )
+                self.ssd_kv_cache.read_block(
+                    transfer.src_block_id, destination, self.swap_stream
+                )
+            return
+
+        source = self._cache_block(src_tier, transfer.src_block_id)
+        destination = self._cache_block(dst_tier, transfer.dst_block_id)
+        with torch.cuda.stream(self.swap_stream):
+            destination.copy_(source, non_blocking=True)
+
+    @torch.inference_mode()
     def swap_blocks(self, blocks_to_swap_in, blocks_to_swap_out):
         if not blocks_to_swap_in and not blocks_to_swap_out:
             return
-        if blocks_to_swap_in and blocks_to_swap_out:
-            raise RuntimeError("Cannot swap in and out at the same time.")
-        if self.cpu_kv_cache is None:
-            raise RuntimeError("CPU KV cache is not allocated.")
 
         current_stream = torch.cuda.current_stream()
         self.swap_stream.wait_stream(current_stream)
 
-        gpu_layer_caches = self.kv_cache.flatten(0,1)
-        cpu_layer_caches = self.cpu_kv_cache.flatten(0,1)
-
-        with torch.cuda.stream(self.swap_stream):
-            for gpu_block_id, cpu_block_id in blocks_to_swap_out:
-                for gpu_cache, cpu_cache in zip(gpu_layer_caches, cpu_layer_caches):
-                    cpu_cache[cpu_block_id].copy_(gpu_cache[gpu_block_id], non_blocking=True)
-
-            for cpu_block_id, gpu_block_id in blocks_to_swap_in:
-                for gpu_cache, cpu_cache in zip(gpu_layer_caches, cpu_layer_caches):
-                    gpu_cache[gpu_block_id].copy_(cpu_cache[cpu_block_id], non_blocking=True)
+        for transfer in blocks_to_swap_out:
+            self._transfer_block(transfer)
+        for transfer in blocks_to_swap_in:
+            self._transfer_block(transfer)
 
         self.swap_stream.synchronize()
 

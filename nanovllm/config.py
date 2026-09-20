@@ -1,5 +1,7 @@
 import os
-from dataclasses import dataclass
+import tempfile
+import uuid
+from dataclasses import dataclass, field
 from transformers import AutoConfig
 
 
@@ -18,6 +20,10 @@ class Config:
     num_kvcache_blocks: int = -1
     cpu_kvcache_gb: float = 0.0
     num_cpu_kvcache_blocks: int = -1
+    ssd_kvcache_gb: float = 0.0
+    num_ssd_kvcache_blocks: int = -1
+    ssd_kvcache_path: str | None = None
+    ssd_cache_id: str = field(init=False, repr=False)
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -25,5 +31,13 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.cpu_kvcache_gb >= 0
         assert self.num_cpu_kvcache_blocks >= -1
+        assert self.ssd_kvcache_gb >= 0
+        assert self.num_ssd_kvcache_blocks >= -1
+        if self.ssd_kvcache_path is None:
+            self.ssd_kvcache_path = tempfile.gettempdir()
+        self.ssd_kvcache_path = os.path.abspath(
+            os.path.expanduser(self.ssd_kvcache_path)
+        )
+        self.ssd_cache_id = uuid.uuid4().hex
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
