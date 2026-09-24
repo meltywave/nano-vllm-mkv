@@ -1,8 +1,16 @@
 from collections import deque
-import xxhash
-import numpy as np
+from dataclasses import dataclass
+import hashlib
 
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import CacheTier, Sequence
+
+
+@dataclass(frozen=True, slots=True)
+class BlockTransfer:
+    src_tier: CacheTier
+    src_block_id: int
+    dst_tier: CacheTier
+    dst_block_id: int
 
 
 class Block:
@@ -25,20 +33,36 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(
+        self,
+        num_blocks: int,
+        block_size: int,
+        num_cpu_blocks: int = 0,
+        num_ssd_blocks: int = 0,
+        num_remote_blocks: int = 0,
+        enable_prefix_cache: bool = True,
+    ):
         self.block_size = block_size
+        self.enable_prefix_cache = enable_prefix_cache
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        self.cpu_blocks = [Block(i) for i in range(num_cpu_blocks)]
+        self.free_cpu_block_ids = deque(range(num_cpu_blocks))
+        self.ssd_blocks = [Block(i) for i in range(num_ssd_blocks)]
+        self.free_ssd_block_ids = deque(range(num_ssd_blocks))
+        self.remote_blocks = [Block(i) for i in range(num_remote_blocks)]
+        self.free_remote_block_ids = deque(range(num_remote_blocks))
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
-        h = xxhash.xxh64()
+        h = hashlib.blake2b(digest_size=8)
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
-        h.update(np.array(token_ids).tobytes())
-        return h.intdigest()
+        for token_id in token_ids:
+            h.update(int(token_id).to_bytes(8, "little", signed=False))
+        return int.from_bytes(h.digest(), "little")
 
     def _allocate_block(self) -> int:
         block_id = self.free_block_ids.popleft()
@@ -56,6 +80,8 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
+        if not self.enable_prefix_cache:
+            return 0 if len(self.free_block_ids) >= seq.num_blocks else -1
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
@@ -74,6 +100,7 @@ class BlockManager:
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
+        assert seq.block_table_tier == CacheTier.GPU
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
@@ -92,6 +119,7 @@ class BlockManager:
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
     def deallocate(self, seq: Sequence):
+        assert seq.block_table_tier == CacheTier.GPU
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
             block.ref_count -= 1
@@ -117,4 +145,149 @@ class BlockManager:
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
-            self.hash_to_block_id[h] = block.block_id
+            if self.enable_prefix_cache:
+                self.hash_to_block_id[h] = block.block_id
+
+    def clear_prefix_cache(self):
+        if self.used_block_ids:
+            raise RuntimeError("Cannot clear prefix cache while GPU blocks are in use")
+        self.hash_to_block_id.clear()
+        for block in self.blocks:
+            block.hash = -1
+            block.token_ids = []
+
+    def _blocks_for_tier(self, tier: CacheTier) -> list[Block]:
+        if tier == CacheTier.GPU:
+            return self.blocks
+        if tier == CacheTier.CPU:
+            return self.cpu_blocks
+        if tier == CacheTier.SSD:
+            return self.ssd_blocks
+        if tier == CacheTier.REMOTE:
+            return self.remote_blocks
+        raise ValueError(f"Unknown cache tier: {tier!r}")
+
+    def _free_ids_for_tier(self, tier: CacheTier) -> deque[int]:
+        if tier == CacheTier.GPU:
+            return self.free_block_ids
+        if tier == CacheTier.CPU:
+            return self.free_cpu_block_ids
+        if tier == CacheTier.SSD:
+            return self.free_ssd_block_ids
+        if tier == CacheTier.REMOTE:
+            return self.free_remote_block_ids
+        raise ValueError(f"Unknown cache tier: {tier!r}")
+
+    def capacity(self, tier: CacheTier) -> int:
+        return len(self._blocks_for_tier(tier))
+
+    def num_free_blocks(self, tier: CacheTier) -> int:
+        return len(self._free_ids_for_tier(tier))
+
+    def num_used_blocks(self, tier: CacheTier) -> int:
+        return self.capacity(tier) - self.num_free_blocks(tier)
+
+    def utilization(self, tier: CacheTier) -> float:
+        capacity = self.capacity(tier)
+        return self.num_used_blocks(tier) / capacity if capacity else 0.0
+
+    def is_exclusively_owned(self, seq: Sequence) -> bool:
+        blocks = self._blocks_for_tier(seq.block_table_tier)
+        return all(blocks[block_id].ref_count == 1 for block_id in seq.block_table)
+
+    def can_swap(
+        self,
+        seq: Sequence,
+        target_tier: CacheTier,
+        extra_blocks: int = 0,
+    ) -> bool:
+        if seq.block_table_tier == target_tier:
+            return False
+        if not self.is_exclusively_owned(seq):
+            return False
+        required = len(seq.block_table) + extra_blocks
+        return self.num_free_blocks(target_tier) >= required
+
+    def can_swap_out(
+        self,
+        seq: Sequence,
+        target_tier: CacheTier = CacheTier.CPU,
+    ) -> bool:
+        return self.can_swap(seq, target_tier)
+
+    def can_swap_in(self, seq: Sequence, extra_gpu_blocks: int = 0) -> bool:
+        return self.can_swap(seq, CacheTier.GPU, extra_gpu_blocks)
+
+    def _allocate_offload_block(self, tier: CacheTier, src: Block) -> int:
+        block_id = self._free_ids_for_tier(tier).popleft()
+        block = self._blocks_for_tier(tier)[block_id]
+        assert block.ref_count == 0
+        block.ref_count = 1
+        block.update(src.hash, list(src.token_ids))
+        return block_id
+
+    def _release_offload_block(self, tier: CacheTier, block_id: int):
+        block = self._blocks_for_tier(tier)[block_id]
+        assert block.ref_count == 1
+        block.ref_count = 0
+        block.hash = -1
+        block.token_ids = []
+        self._free_ids_for_tier(tier).append(block_id)
+
+    def swap(
+        self,
+        seq: Sequence,
+        target_tier: CacheTier,
+    ) -> list[BlockTransfer]:
+        source_tier = seq.block_table_tier
+        if not self.can_swap(seq, target_tier):
+            raise RuntimeError(
+                f"Cannot swap {len(seq.block_table)} blocks from "
+                f"{source_tier.value} to {target_tier.value}."
+            )
+
+        source_blocks = self._blocks_for_tier(source_tier)
+        target_table = []
+        transfers = []
+        for source_id in seq.block_table:
+            source_block = source_blocks[source_id]
+            if target_tier == CacheTier.GPU:
+                target_id = self._allocate_block()
+                target_block = self.blocks[target_id]
+                target_block.update(source_block.hash, list(source_block.token_ids))
+                if target_block.hash != -1:
+                    self.hash_to_block_id[target_block.hash] = target_id
+            else:
+                target_id = self._allocate_offload_block(
+                    target_tier, source_block
+                )
+            target_table.append(target_id)
+            transfers.append(
+                BlockTransfer(source_tier, source_id, target_tier, target_id)
+            )
+
+        if source_tier == CacheTier.GPU:
+            for source_id in reversed(seq.block_table):
+                block = self.blocks[source_id]
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self._deallocate_block(source_id)
+        else:
+            for source_id in seq.block_table:
+                self._release_offload_block(source_tier, source_id)
+
+        seq.block_table = target_table
+        seq.block_table_tier = target_tier
+        return transfers
+
+    def swap_out(
+        self,
+        seq: Sequence,
+        target_tier: CacheTier = CacheTier.CPU,
+    ) -> list[BlockTransfer]:
+        assert seq.block_table_tier == CacheTier.GPU
+        return self.swap(seq, target_tier)
+
+    def swap_in(self, seq: Sequence) -> list[BlockTransfer]:
+        assert seq.block_table_tier != CacheTier.GPU
+        return self.swap(seq, CacheTier.GPU)

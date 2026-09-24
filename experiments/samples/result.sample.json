@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "run_id": "20260922-143000-a1b2c3d",
+  "engine": {"level": 3, "tiers": ["gpu", "cpu", "ssd"], "policy": "waterfall_lru"},
+  "model": {"path": "MODEL_PATH", "id": "Qwen3-0.6B", "revision": "local", "dtype": "torch.bfloat16"},
+  "workload": {"name": "review_long_unique", "sha256": "example", "actual_input_tokens": 2048, "output_tokens": 128, "num_seqs": 4},
+  "initialization": {"total_s": 2.41, "included_in_measurement": false},
+  "measurements": [
+    {
+      "repeat": 1,
+      "input_tokens": 2048,
+      "output_tokens": 512,
+      "latency_s": 8.2,
+      "ttft_ms": 119.2,
+      "prefill_tokens_per_s": 18420.0,
+      "decode_tokens_per_s": 412.5,
+      "total_tokens_per_s": 312.2,
+      "gpu_peak_allocated_bytes": 7730941132,
+      "transfer_counts": {"gpu_to_cpu": 8, "cpu_to_ssd": 2, "ssd_to_gpu": 2},
+      "transfer_time_s": 0.41,
+      "io_errors": 0,
+      "output_sha256": "example",
+      "error": null
+    }
+  ],
+  "summary": {
+    "measurement_repeats": 1,
+    "latency_s": {"mean": 8.2, "p50": 8.2, "p95": 8.2},
+    "total_tokens_per_s": {"mean": 312.2, "std": 0.0},
+    "gpu_peak_allocated_bytes": {"max": 7730941132},
+    "correctness": {"repeat_outputs_match": true, "output_sha256": "example", "matches_engine_1": null}
+  }
+}

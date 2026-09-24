@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "name": "smoke",
+  "description": "Review workload with distinct technical prompts and deterministic exact-length expansion.",
+  "benchmark_preset": "main",
+  "prompt_file": "experiments/prompts/review_long_unique.jsonl",
+  "prompt_count": 4,
+  "target_prompt_tokens": 512,
+  "output_tokens": 128,
+  "num_seqs": 4,
+  "max_model_len": 1024,
+  "seed": 0,
+  "sampling": {"temperature": 0.00001, "ignore_eos": true},
+  "prefix_mode": "unique",
+  "tokenizer_check": "model_tokenizer",
+  "length_policy": "repeat_or_truncate",
+  "synthetic": true
+}

@@ -1,31 +1,41 @@
-import os
-import time
-from random import randint, seed
-from nanovllm import LLM, SamplingParams
-# from vllm import LLM, SamplingParams
+import argparse
+from pathlib import Path
+
+from experiments.results import DEFAULT_RESULT_DIR
+from experiments.runners.nano_runner import run_nano_experiment
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run a structured nano-vLLM multi-level KV cache experiment."
+    )
+    parser.add_argument("--engine", type=int, choices=(1, 2, 3, 4), required=True)
+    parser.add_argument("--model", required=True, help="Local model directory")
+    parser.add_argument("--workload", required=True, help="Workload manifest JSON")
+    parser.add_argument(
+        "--result-dir",
+        type=Path,
+        default=DEFAULT_RESULT_DIR,
+        help=f"Result root (default: {DEFAULT_RESULT_DIR})",
+    )
+    return parser.parse_args()
 
 
 def main():
-    seed(0)
-    num_seqs = 256
-    max_input_len = 1024
-    max_ouput_len = 1024
-
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    llm = LLM(path, enforce_eager=False, max_model_len=4096)
-
-    prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
-    sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
-    # uncomment the following line for vllm
-    # prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
-
-    llm.generate(["Benchmark: "], SamplingParams())
-    t = time.time()
-    llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
-    t = (time.time() - t)
-    total_tokens = sum(sp.max_tokens for sp in sampling_params)
-    throughput = total_tokens / t
-    print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s")
+    args = parse_args()
+    result_path, result = run_nano_experiment(
+        args.engine,
+        args.model,
+        args.workload,
+        args.result_dir,
+    )
+    summary = result["summary"]
+    print(f"Result: {result_path}")
+    print(f"Mean latency: {summary['latency_s']['mean']:.3f}s")
+    print(
+        "Mean throughput: "
+        f"{summary['total_tokens_per_s']['mean']:.2f} tokens/s"
+    )
 
 
 if __name__ == "__main__":

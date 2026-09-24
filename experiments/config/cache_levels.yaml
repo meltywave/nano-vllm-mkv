@@ -1,0 +1,72 @@
+{
+  "_comment": "JSON-compatible YAML: parsed with Python json so no extra YAML dependency is required.",
+  "capacity_profiles": {
+    "local_default": {
+      "_comment": "Portable defaults. GPU capacity is profiled; lower-tier GiB values are divided across tensor-parallel ranks.",
+      "gpu_memory_utilization": 0.90,
+      "num_kvcache_blocks": -1,
+      "cpu_kvcache_gb": 4.0,
+      "num_cpu_kvcache_blocks": -1,
+      "ssd_kvcache_gb": 16.0,
+      "num_ssd_kvcache_blocks": -1,
+      "ssd_kvcache_path": null,
+      "remote_kvcache_gb": 32.0,
+      "num_remote_kvcache_blocks": -1,
+      "remote_kvcache_host": "127.0.0.1",
+      "remote_kvcache_port": 19090,
+      "remote_kvcache_timeout": 30.0,
+      "kv_enable_prefix_cache": true
+    }
+  },
+  "levels": {
+    "1": {
+      "_comment": "Original nano-vLLM baseline: GPU only; no swap backend is allocated.",
+      "tiers": ["gpu"],
+      "capacity_profile": "local_default",
+      "policy": "waterfall_lru",
+      "max_transfer_blocks": -1,
+      "watermarks": {"gpu": {"high": 0.90, "low": 0.70}}
+    },
+    "2": {
+      "_comment": "GPU blocks spill to pinned CPU memory.",
+      "tiers": ["gpu", "cpu"],
+      "capacity_profile": "local_default",
+      "policy": "waterfall_lru",
+      "max_transfer_blocks": -1,
+      "watermarks": {
+        "gpu": {"high": 0.90, "low": 0.70},
+        "cpu": {"high": 0.90, "low": 0.70}
+      }
+    },
+    "3": {
+      "_comment": "Local multi-level cache. CPU pressure demotes cold sequences to SSD.",
+      "tiers": ["gpu", "cpu", "ssd"],
+      "capacity_profile": "local_default",
+      "policy": "waterfall_lru",
+      "max_transfer_blocks": -1,
+      "watermarks": {
+        "gpu": {"high": 0.90, "low": 0.70},
+        "cpu": {"high": 0.90, "low": 0.70},
+        "ssd": {"high": 0.90, "low": 0.70}
+      }
+    },
+    "4": {
+      "_comment": "Full prototype. Start remote_cache_server before running this level.",
+      "tiers": ["gpu", "cpu", "ssd", "remote"],
+      "capacity_profile": "local_default",
+      "policy": "waterfall_lru",
+      "max_transfer_blocks": -1,
+      "watermarks": {
+        "gpu": {"high": 0.90, "low": 0.70},
+        "cpu": {"high": 0.90, "low": 0.70},
+        "ssd": {"high": 0.90, "low": 0.70},
+        "remote": {"high": 0.95, "low": 0.80}
+      }
+    }
+  },
+  "main_mkv": {
+    "_comment": "Lock this before main-table runs; do not choose it from main-table results.",
+    "engine": 3,
+    "capacity_profile": "local_default"
+  }
+}

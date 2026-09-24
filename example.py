@@ -4,9 +4,20 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = os.path.expanduser("~/models/Qwen3-0.6B/")
     tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
+    llm = LLM(
+        path,
+        # Local example: start the remote server and use cache_engine=4 only
+        # when explicitly testing the remote tier.
+        cache_engine=3,
+        enforce_eager=True,
+        num_kvcache_blocks=16,
+        num_cpu_kvcache_blocks=64,
+        num_ssd_kvcache_blocks=256,
+        ssd_kvcache_path=os.path.expanduser("~/nanovllm-kv-cache"),
+        max_model_len=4096,
+    )
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [

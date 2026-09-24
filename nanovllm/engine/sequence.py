@@ -8,7 +8,15 @@ from nanovllm.sampling_params import SamplingParams
 class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
+    SWAPPED = auto()
     FINISHED = auto()
+
+
+class CacheTier(Enum):
+    GPU = "gpu"
+    CPU = "cpu"
+    SSD = "ssd"
+    REMOTE = "remote"
 
 
 class Sequence:
@@ -16,6 +24,8 @@ class Sequence:
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+        if not token_ids:
+            raise ValueError("Sequence requires at least one prompt token")
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -26,6 +36,9 @@ class Sequence:
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
+        self.block_table_tier = CacheTier.GPU
+        self.last_used_step = -1
+        self.num_swaps = 0
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -71,10 +84,30 @@ class Sequence:
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        return (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            self.block_table_tier,
+            self.last_used_step,
+            self.num_swaps,
+            last_state,
+        )
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            self.block_table_tier,
+            self.last_used_step,
+            self.num_swaps,
+            last_state,
+        ) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

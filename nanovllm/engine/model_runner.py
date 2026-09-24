@@ -1,11 +1,15 @@
 import pickle
+from time import perf_counter
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.block_manager import BlockTransfer
+from nanovllm.engine.remote_cache import RemoteCache
+from nanovllm.engine.sequence import CacheTier, Sequence
+from nanovllm.engine.ssd_cache import SSDCache
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -22,6 +26,10 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.transfer_counts = {}
+        self.transfer_bytes = {}
+        self.transfer_time_s = 0.0
+        self.io_errors = 0
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -56,6 +64,10 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
+        if self.ssd_kv_cache is not None:
+            self.ssd_kv_cache.close()
+        if self.remote_kv_cache is not None:
+            self.remote_kv_cache.close()
         dist.destroy_process_group()
 
     def loop(self):
@@ -107,18 +119,230 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_block_bytes = block_bytes
+
+        profiled_gpu_blocks = (
+            int((total * config.gpu_memory_utilization - used - peak + current) // block_bytes)
+        )
+
+        if config.num_kvcache_blocks > 0:
+            num_gpu_blocks = min(config.num_kvcache_blocks, profiled_gpu_blocks)
+        else:
+            num_gpu_blocks = profiled_gpu_blocks
+
+        if self.world_size > 1:
+            count = torch.tensor(num_gpu_blocks, dtype=torch.int64, device="cuda")
+            dist.all_reduce(count, op=dist.ReduceOp.MIN)
+            num_gpu_blocks = int(count.item())
+        if num_gpu_blocks <= 0:
+            raise RuntimeError(
+                f"Not enough GPU memory for KV cache. "
+            )
+        config.num_kvcache_blocks = num_gpu_blocks
+
+        if config.num_cpu_kvcache_blocks >= 0:
+            num_cpu_blocks = config.num_cpu_kvcache_blocks
+        else:
+            cpu_bytes_per_rank = int(
+                config.cpu_kvcache_gb * 1024**3 / self.world_size
+            )
+            num_cpu_blocks = cpu_bytes_per_rank // block_bytes
+
+        if config.cpu_kvcache_gb > 0 and num_cpu_blocks == 0:
+            raise RuntimeError(
+                f"cpu_kvcache_gb is smaller than one logical KV block. "
+            )
+        config.num_cpu_kvcache_blocks = num_cpu_blocks
+
+        if config.num_ssd_kvcache_blocks >= 0:
+            num_ssd_blocks = config.num_ssd_kvcache_blocks
+        else:
+            ssd_bytes_per_rank = int(
+                config.ssd_kvcache_gb * 1024**3 / self.world_size
+            )
+            num_ssd_blocks = ssd_bytes_per_rank // block_bytes
+
+        if config.ssd_kvcache_gb > 0 and num_ssd_blocks == 0:
+            raise RuntimeError(
+                "ssd_kvcache_gb is smaller than one logical KV block."
+            )
+        config.num_ssd_kvcache_blocks = num_ssd_blocks
+
+        if config.num_remote_kvcache_blocks >= 0:
+            num_remote_blocks = config.num_remote_kvcache_blocks
+        else:
+            remote_bytes_per_rank = int(
+                config.remote_kvcache_gb * 1024**3 / self.world_size
+            )
+            num_remote_blocks = remote_bytes_per_rank // block_bytes
+
+        if config.remote_kvcache_gb > 0 and num_remote_blocks == 0:
+            raise RuntimeError(
+                "remote_kvcache_gb is smaller than one logical KV block."
+            )
+        config.num_remote_kvcache_blocks = num_remote_blocks
+
+        tier_blocks = {
+            "cpu": num_cpu_blocks,
+            "ssd": num_ssd_blocks,
+            "remote": num_remote_blocks,
+        }
+        for tier in config.kv_cache_tiers[1:]:
+            if tier_blocks[tier] <= 0:
+                raise RuntimeError(
+                    f"cache_engine={config.cache_engine} enables {tier}, but "
+                    f"its KV cache capacity is zero. Configure num_{tier}_"
+                    "kvcache_blocks or the corresponding *_kvcache_gb value."
+                )
+
+        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, num_gpu_blocks, self.block_size, num_kv_heads, head_dim, dtype=hf_config.dtype, device="cuda")
+
+        self.cpu_kv_cache = None
+        if num_cpu_blocks > 0:
+            self.cpu_kv_cache = torch.empty(2, hf_config.num_hidden_layers, num_cpu_blocks, self.block_size, num_kv_heads, head_dim, dtype=hf_config.dtype, device="cpu", pin_memory=True)
+        self.swap_stream = torch.cuda.Stream()
+        cache_block_shape = (
+            2,
+            hf_config.num_hidden_layers,
+            self.block_size,
+            num_kv_heads,
+            head_dim,
+        )
+        self.ssd_kv_cache = None
+        if num_ssd_blocks > 0:
+            self.ssd_kv_cache = SSDCache(
+                config.ssd_kvcache_path,
+                config.ssd_cache_id,
+                self.rank,
+                num_ssd_blocks,
+                cache_block_shape,
+                hf_config.dtype,
+            )
+        self.remote_kv_cache = None
+        if num_remote_blocks > 0:
+            self.remote_kv_cache = RemoteCache(
+                config.remote_kvcache_host,
+                config.remote_kvcache_port,
+                config.remote_kvcache_timeout,
+                f"{config.ssd_cache_id}-rank{self.rank}",
+                num_remote_blocks,
+                cache_block_shape,
+                hf_config.dtype,
+            )
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+
+    @torch.inference_mode()
+    def _cache_block(self, tier: CacheTier, block_id: int):
+        if tier == CacheTier.GPU:
+            return self.kv_cache[:, :, block_id]
+        if tier == CacheTier.CPU:
+            if self.cpu_kv_cache is None:
+                raise RuntimeError("CPU KV cache is not allocated.")
+            return self.cpu_kv_cache[:, :, block_id]
+        raise ValueError(
+            "SSD and remote blocks must be accessed through their backends."
+        )
+
+    def _offload_cache(self, tier: CacheTier):
+        if tier == CacheTier.SSD:
+            cache = self.ssd_kv_cache
+        elif tier == CacheTier.REMOTE:
+            cache = self.remote_kv_cache
+        else:
+            raise ValueError(f"{tier.value} is not an offload cache tier.")
+        if cache is None:
+            raise RuntimeError(f"{tier.value.upper()} KV cache is not allocated.")
+        return cache
+
+    def _transfer_block(self, transfer: BlockTransfer):
+        src_tier, dst_tier = transfer.src_tier, transfer.dst_tier
+        offload_tiers = (CacheTier.SSD, CacheTier.REMOTE)
+        if src_tier not in offload_tiers and dst_tier not in offload_tiers:
+            source = self._cache_block(src_tier, transfer.src_block_id)
+            destination = self._cache_block(dst_tier, transfer.dst_block_id)
+            with torch.cuda.stream(self.swap_stream):
+                destination.copy_(source, non_blocking=True)
+            return
+
+        # A previous asynchronous local copy may target a block reused here.
+        self.swap_stream.synchronize()
+        if src_tier in offload_tiers and dst_tier in offload_tiers:
+            source_cache = self._offload_cache(src_tier)
+            destination_cache = self._offload_cache(dst_tier)
+            staging = destination_cache.staging
+            source_cache.read_block(
+                transfer.src_block_id, staging, self.swap_stream
+            )
+            destination_cache.write_block(
+                transfer.dst_block_id, staging, self.swap_stream
+            )
+        elif dst_tier in offload_tiers:
+            source = self._cache_block(src_tier, transfer.src_block_id)
+            self._offload_cache(dst_tier).write_block(
+                transfer.dst_block_id, source, self.swap_stream
+            )
+        else:
+            destination = self._cache_block(dst_tier, transfer.dst_block_id)
+            self._offload_cache(src_tier).read_block(
+                transfer.src_block_id, destination, self.swap_stream
+            )
+
+    @torch.inference_mode()
+    def swap_blocks(self, blocks_to_swap_in, blocks_to_swap_out):
+        if not blocks_to_swap_in and not blocks_to_swap_out:
+            return
+
+        started = perf_counter()
+        current_stream = torch.cuda.current_stream()
+        self.swap_stream.wait_stream(current_stream)
+        transfers = [*blocks_to_swap_out, *blocks_to_swap_in]
+        try:
+            for transfer in transfers:
+                self._transfer_block(transfer)
+            self.swap_stream.synchronize()
+        except Exception:
+            self.io_errors += 1
+            raise
+        finally:
+            self.transfer_time_s += perf_counter() - started
+
+        for transfer in transfers:
+            key = f"{transfer.src_tier.value}_to_{transfer.dst_tier.value}"
+            self.transfer_counts[key] = self.transfer_counts.get(key, 0) + 1
+            self.transfer_bytes[key] = (
+                self.transfer_bytes.get(key, 0) + self.kv_block_bytes
+            )
+
+    def get_cache_stats(self):
+        return {
+            "kv_block_bytes": self.kv_block_bytes,
+            "transfer_counts": dict(self.transfer_counts),
+            "transfer_bytes": dict(self.transfer_bytes),
+            "transfer_time_s": self.transfer_time_s,
+            "io_errors": self.io_errors,
+            "cpu_pinned_capacity_bytes": (
+                self.config.num_cpu_kvcache_blocks * self.kv_block_bytes
+            ),
+            "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+        }
+
+    def reset_cache_stats(self):
+        self.transfer_counts.clear()
+        self.transfer_bytes.clear()
+        self.transfer_time_s = 0.0
+        self.io_errors = 0
+        torch.cuda.reset_peak_memory_stats()
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -211,11 +435,24 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    def run(self, seqs: list[Sequence], is_prefill: bool, blocks_to_swap_in=None, blocks_to_swap_out=None) -> list[int]:
+        self.swap_blocks(blocks_to_swap_in or [], blocks_to_swap_out or [])
+
+        if not seqs:
+            return []
+
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
+
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = (
+            self.sampler(logits, temperatures).tolist()
+            if self.rank == 0
+            else None
+        )
         reset_context()
         return token_ids
 

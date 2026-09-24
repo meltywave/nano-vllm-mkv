@@ -1,0 +1,7 @@
+{
+  "_comment": "Run counts live here rather than on the CLI so comparable runs cannot silently use different repeats.",
+  "presets": {
+    "smoke": {"warmup_runs": 1, "measurement_repeats": 1},
+    "main": {"warmup_runs": 1, "measurement_repeats": 5}
+  }
+}
