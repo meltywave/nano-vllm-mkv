@@ -20,7 +20,7 @@
   },
   "levels": {
     "1": {
-      "_comment": "Original nano-vLLM baseline: GPU only; no swap backend is allocated.",
+      "_comment": "Same-repository GPU-only reference; it is not the upstream nano-vLLM baseline.",
       "tiers": ["gpu"],
       "capacity_profile": "local_default",
       "policy": "waterfall_lru",
@@ -65,8 +65,8 @@
     }
   },
   "main_mkv": {
-    "_comment": "Lock this before main-table runs; do not choose it from main-table results.",
-    "engine": 3,
+    "_comment": "Informational only. Run settings are locked by run_ablation CLI and selected with tables --main-config-id.",
+    "engine": 4,
     "capacity_profile": "local_default"
   }
 }

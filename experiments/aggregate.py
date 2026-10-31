@@ -3,6 +3,8 @@ import csv
 import json
 from pathlib import Path
 
+from experiments.tables import _baseline_lookup, _path_key
+
 
 def main():
     parser = argparse.ArgumentParser(description="Aggregate nano-vLLM result.json files")
@@ -15,18 +17,12 @@ def main():
         with path.open("r", encoding="utf-8") as file:
             results.append((path, json.load(file)))
 
-    baseline_hashes = {
-        (result["model"]["id"], result["workload"]["name"]): result["summary"]
-        ["correctness"]
-        .get("output_sha256")
-        for _, result in results
-        if result["engine"]["level"] == 1
-    }
+    baseline_hashes = _baseline_lookup(results)
     rows = []
     for path, result in results:
-        key = (result["model"]["id"], result["workload"]["name"])
+        key = _path_key(result)
         output_hash = result["summary"]["correctness"].get("output_sha256")
-        baseline_hash = baseline_hashes.get(key)
+        candidates = baseline_hashes.get(key, set())
         rows.append(
             {
                 "engine": result["engine"]["level"],
@@ -38,8 +34,8 @@ def main():
                 "gpu_peak_allocated_bytes": result["summary"]["gpu_peak_allocated_bytes"]["max"],
                 "output_sha256": output_hash,
                 "matches_engine_1": (
-                    None if baseline_hash is None or output_hash is None
-                    else output_hash == baseline_hash
+                    None if len(candidates) != 1 or output_hash is None
+                    else output_hash in candidates
                 ),
                 "result_path": str(path),
             }

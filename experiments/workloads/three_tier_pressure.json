@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "name": "three_tier_pressure",
+  "description": "Prototype workload to calibrate GPU, CPU, and SSD activity without Remote transfers.",
+  "benchmark_preset": "main",
+  "prompt_file": "experiments/prompts/review_long_unique.jsonl",
+  "prompt_count": 4,
+  "request_count": 8,
+  "num_seqs": 4,
+  "max_num_seqs": 4,
+  "max_num_batched_tokens": 512,
+  "target_prompt_tokens": 512,
+  "output_tokens": 320,
+  "max_model_len": 1024,
+  "seed": 0,
+  "sampling": {"temperature": 0.0, "ignore_eos": true},
+  "length_policy": "repeat_or_truncate",
+  "repeat_prompts": true,
+  "unique_repeats": true,
+  "required_tiers": {"2": "cpu", "3": "ssd", "4": "ssd"},
+  "forbidden_tiers": {"4": ["remote"]},
+  "synthetic": true
+}
