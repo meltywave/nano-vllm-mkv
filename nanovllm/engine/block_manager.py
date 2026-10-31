@@ -13,6 +13,27 @@ class BlockTransfer:
     dst_block_id: int
 
 
+@dataclass(slots=True)
+class SwapPlan:
+    seq: Sequence
+    source_tier: CacheTier
+    target_tier: CacheTier
+    source_table: list[int]
+    target_table: list[int]
+    transfers: list[BlockTransfer]
+
+
+@dataclass(slots=True)
+class BlockMovePlan:
+    seq: Sequence
+    index: int
+    source_tier: CacheTier
+    source_id: int
+    target_tier: CacheTier
+    target_id: int
+    transfer: BlockTransfer
+
+
 class Block:
 
     def __init__(self, block_id):
@@ -20,6 +41,8 @@ class Block:
         self.ref_count = 0
         self.hash = -1
         self.token_ids = []
+        self.last_used_step = -1
+        self.reuse_hits = 0
 
     def update(self, hash: int, token_ids: list[int]):
         self.hash = hash
@@ -29,6 +52,8 @@ class Block:
         self.ref_count = 1
         self.hash = -1
         self.token_ids = []
+        self.last_used_step = -1
+        self.reuse_hits = 0
 
 
 class BlockManager:
@@ -107,6 +132,7 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id[h]
             block = self.blocks[block_id]
+            block.reuse_hits += 1
             if block_id in self.used_block_ids:
                 block.ref_count += 1
             else:
@@ -114,19 +140,26 @@ class BlockManager:
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
+            seq.block_tiers.append(CacheTier.GPU)
         for i in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
+            seq.block_tiers.append(CacheTier.GPU)
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
     def deallocate(self, seq: Sequence):
-        assert seq.block_table_tier == CacheTier.GPU
-        for block_id in reversed(seq.block_table):
-            block = self.blocks[block_id]
-            block.ref_count -= 1
-            if block.ref_count == 0:
-                self._deallocate_block(block_id)
+        assert len(seq.block_tiers) == len(seq.block_table)
+        for tier, block_id in reversed(list(zip(seq.block_tiers, seq.block_table))):
+            if tier == CacheTier.GPU:
+                block = self.blocks[block_id]
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self._deallocate_block(block_id)
+            else:
+                self._release_offload_block(tier, block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+        seq.block_tiers.clear()
+        seq.block_table_tier = CacheTier.GPU
 
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
@@ -134,6 +167,11 @@ class BlockManager:
     def may_append(self, seq: Sequence):
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
+            seq.block_tiers.append(CacheTier.GPU)
+
+    def touch(self, seq: Sequence, step: int):
+        for tier, block_id in zip(seq.block_tiers, seq.block_table):
+            self._blocks_for_tier(tier)[block_id].last_used_step = step
 
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
@@ -224,6 +262,8 @@ class BlockManager:
         assert block.ref_count == 0
         block.ref_count = 1
         block.update(src.hash, list(src.token_ids))
+        block.last_used_step = src.last_used_step
+        block.reuse_hits = src.reuse_hits
         return block_id
 
     def _release_offload_block(self, tier: CacheTier, block_id: int):
@@ -234,11 +274,11 @@ class BlockManager:
         block.token_ids = []
         self._free_ids_for_tier(tier).append(block_id)
 
-    def swap(
+    def prepare_swap(
         self,
         seq: Sequence,
         target_tier: CacheTier,
-    ) -> list[BlockTransfer]:
+    ) -> SwapPlan:
         source_tier = seq.block_table_tier
         if not self.can_swap(seq, target_tier):
             raise RuntimeError(
@@ -247,38 +287,81 @@ class BlockManager:
             )
 
         source_blocks = self._blocks_for_tier(source_tier)
+        source_table = list(seq.block_table)
         target_table = []
         transfers = []
-        for source_id in seq.block_table:
-            source_block = source_blocks[source_id]
-            if target_tier == CacheTier.GPU:
-                target_id = self._allocate_block()
-                target_block = self.blocks[target_id]
-                target_block.update(source_block.hash, list(source_block.token_ids))
-                if target_block.hash != -1:
-                    self.hash_to_block_id[target_block.hash] = target_id
-            else:
-                target_id = self._allocate_offload_block(
-                    target_tier, source_block
+        try:
+            for source_id in source_table:
+                source_block = source_blocks[source_id]
+                if target_tier == CacheTier.GPU:
+                    target_id = self._allocate_block()
+                    self.blocks[target_id].update(
+                        source_block.hash, list(source_block.token_ids)
+                    )
+                    self.blocks[target_id].last_used_step = source_block.last_used_step
+                    self.blocks[target_id].reuse_hits = source_block.reuse_hits
+                else:
+                    target_id = self._allocate_offload_block(
+                        target_tier, source_block
+                    )
+                target_table.append(target_id)
+                transfers.append(
+                    BlockTransfer(source_tier, source_id, target_tier, target_id)
                 )
-            target_table.append(target_id)
-            transfers.append(
-                BlockTransfer(source_tier, source_id, target_tier, target_id)
+        except Exception:
+            self.abort_swap(
+                SwapPlan(
+                    seq, source_tier, target_tier, source_table, target_table, transfers
+                )
             )
+            raise
+        return SwapPlan(
+            seq, source_tier, target_tier, source_table, target_table, transfers
+        )
 
-        if source_tier == CacheTier.GPU:
-            for source_id in reversed(seq.block_table):
+    def abort_swap(self, plan: SwapPlan):
+        if plan.target_tier == CacheTier.GPU:
+            for target_id in reversed(plan.target_table):
+                block = self.blocks[target_id]
+                block.ref_count = 0
+                self._deallocate_block(target_id)
+                block.hash = -1
+                block.token_ids = []
+        else:
+            for target_id in plan.target_table:
+                self._release_offload_block(plan.target_tier, target_id)
+
+    def commit_swap(self, plan: SwapPlan):
+        seq = plan.seq
+        if seq.block_table_tier != plan.source_tier or seq.block_table != plan.source_table:
+            raise RuntimeError("Sequence changed while KV transfer was in progress")
+        if plan.source_tier == CacheTier.GPU:
+            for source_id in reversed(plan.source_table):
                 block = self.blocks[source_id]
                 block.ref_count -= 1
                 if block.ref_count == 0:
                     self._deallocate_block(source_id)
         else:
-            for source_id in seq.block_table:
-                self._release_offload_block(source_tier, source_id)
+            for source_id in plan.source_table:
+                self._release_offload_block(plan.source_tier, source_id)
 
-        seq.block_table = target_table
-        seq.block_table_tier = target_tier
-        return transfers
+        seq.block_table = plan.target_table
+        seq.block_table_tier = plan.target_tier
+        seq.block_tiers = [plan.target_tier] * len(plan.target_table)
+        if plan.target_tier == CacheTier.GPU:
+            for target_id in plan.target_table:
+                block = self.blocks[target_id]
+                if self.enable_prefix_cache and block.hash != -1:
+                    self.hash_to_block_id[block.hash] = target_id
+        return plan.transfers
+
+    def swap(
+        self,
+        seq: Sequence,
+        target_tier: CacheTier,
+    ) -> list[BlockTransfer]:
+        """Metadata-only swap for scheduler tests; production uses prepare/commit."""
+        return self.commit_swap(self.prepare_swap(seq, target_tier))
 
     def swap_out(
         self,
@@ -291,3 +374,71 @@ class BlockManager:
     def swap_in(self, seq: Sequence) -> list[BlockTransfer]:
         assert seq.block_table_tier != CacheTier.GPU
         return self.swap(seq, CacheTier.GPU)
+
+    def can_move_block(self, seq: Sequence, index: int, target_tier: CacheTier) -> bool:
+        source_tier = seq.block_tiers[index]
+        source_id = seq.block_table[index]
+        return (
+            source_tier != target_tier
+            and self._blocks_for_tier(source_tier)[source_id].ref_count > 0
+            and self.num_free_blocks(target_tier) > 0
+        )
+
+    def prepare_block_move(
+        self, seq: Sequence, index: int, target_tier: CacheTier
+    ) -> BlockMovePlan:
+        if not self.can_move_block(seq, index, target_tier):
+            raise RuntimeError(f"Cannot move logical block {index} to {target_tier.value}")
+        source_tier = seq.block_tiers[index]
+        source_id = seq.block_table[index]
+        source = self._blocks_for_tier(source_tier)[source_id]
+        if target_tier == CacheTier.GPU:
+            target_id = self._allocate_block()
+            target = self.blocks[target_id]
+            target.update(source.hash, list(source.token_ids))
+            target.last_used_step = source.last_used_step
+            target.reuse_hits = source.reuse_hits
+        else:
+            target_id = self._allocate_offload_block(target_tier, source)
+        return BlockMovePlan(
+            seq, index, source_tier, source_id, target_tier, target_id,
+            BlockTransfer(source_tier, source_id, target_tier, target_id),
+        )
+
+    def abort_block_move(self, plan: BlockMovePlan):
+        if plan.target_tier == CacheTier.GPU:
+            target = self.blocks[plan.target_id]
+            target.ref_count = 0
+            self._deallocate_block(plan.target_id)
+            target.hash = -1
+            target.token_ids = []
+        else:
+            self._release_offload_block(plan.target_tier, plan.target_id)
+
+    def commit_block_move(self, plan: BlockMovePlan) -> BlockTransfer:
+        seq = plan.seq
+        if (seq.block_tiers[plan.index] != plan.source_tier
+                or seq.block_table[plan.index] != plan.source_id):
+            raise RuntimeError("Logical block changed during KV transfer")
+        source = self._blocks_for_tier(plan.source_tier)[plan.source_id]
+        if plan.source_tier == CacheTier.GPU:
+            source.ref_count -= 1
+            if source.ref_count == 0:
+                if self.hash_to_block_id.get(source.hash) == plan.source_id:
+                    del self.hash_to_block_id[source.hash]
+                self._deallocate_block(plan.source_id)
+                source.hash = -1
+                source.token_ids = []
+        else:
+            self._release_offload_block(plan.source_tier, plan.source_id)
+        seq.block_table[plan.index] = plan.target_id
+        seq.block_tiers[plan.index] = plan.target_tier
+        seq.block_table_tier = (
+            plan.target_tier if all(tier == plan.target_tier for tier in seq.block_tiers)
+            else None
+        )
+        if plan.target_tier == CacheTier.GPU:
+            target = self.blocks[plan.target_id]
+            if self.enable_prefix_cache and target.hash != -1:
+                self.hash_to_block_id[target.hash] = plan.target_id
+        return plan.transfer

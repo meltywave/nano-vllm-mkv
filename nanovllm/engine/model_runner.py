@@ -2,6 +2,7 @@ import pickle
 from time import perf_counter
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
@@ -29,6 +30,7 @@ class ModelRunner:
         self.transfer_counts = {}
         self.transfer_bytes = {}
         self.transfer_time_s = 0.0
+        self.transfer_time_by_direction_s = {}
         self.io_errors = 0
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
@@ -38,6 +40,10 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        self.fp32_lm_head_weight = None
+        if config.kv_fp32_greedy_rerank:
+            with torch.inference_mode():
+                self.fp32_lm_head_weight = self.model.lm_head.weight.float()
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -228,7 +234,7 @@ class ModelRunner:
                 config.remote_kvcache_host,
                 config.remote_kvcache_port,
                 config.remote_kvcache_timeout,
-                f"{config.ssd_cache_id}-rank{self.rank}",
+                config.remote_kvcache_namespace or f"{config.ssd_cache_id}-rank{self.rank}",
                 num_remote_blocks,
                 cache_block_shape,
                 hf_config.dtype,
@@ -297,6 +303,14 @@ class ModelRunner:
                 transfer.src_block_id, destination, self.swap_stream
             )
 
+    def _snapshot_block(self, tier: CacheTier, block_id: int):
+        if tier in (CacheTier.GPU, CacheTier.CPU):
+            return self._cache_block(tier, block_id).to("cpu").clone()
+        cache = self._offload_cache(tier)
+        snapshot = torch.empty_like(cache.staging)
+        cache.read_block(block_id, snapshot, self.swap_stream)
+        return snapshot
+
     @torch.inference_mode()
     def swap_blocks(self, blocks_to_swap_in, blocks_to_swap_out):
         if not blocks_to_swap_in and not blocks_to_swap_out:
@@ -308,7 +322,28 @@ class ModelRunner:
         transfers = [*blocks_to_swap_out, *blocks_to_swap_in]
         try:
             for transfer in transfers:
+                transfer_started = perf_counter()
+                expected = (
+                    self._snapshot_block(transfer.src_tier, transfer.src_block_id)
+                    if self.config.kv_verify_transfers else None
+                )
                 self._transfer_block(transfer)
+                self.swap_stream.synchronize()
+                if expected is not None:
+                    actual = self._snapshot_block(
+                        transfer.dst_tier, transfer.dst_block_id
+                    )
+                    if not torch.equal(expected, actual):
+                        raise RuntimeError(
+                            "KV block mismatch after "
+                            f"{transfer.src_tier.value}_to_{transfer.dst_tier.value} "
+                            f"block {transfer.src_block_id}->{transfer.dst_block_id}"
+                        )
+                key = f"{transfer.src_tier.value}_to_{transfer.dst_tier.value}"
+                self.transfer_time_by_direction_s[key] = (
+                    self.transfer_time_by_direction_s.get(key, 0.0)
+                    + perf_counter() - transfer_started
+                )
             self.swap_stream.synchronize()
         except Exception:
             self.io_errors += 1
@@ -329,6 +364,7 @@ class ModelRunner:
             "transfer_counts": dict(self.transfer_counts),
             "transfer_bytes": dict(self.transfer_bytes),
             "transfer_time_s": self.transfer_time_s,
+            "transfer_time_by_direction_s": dict(self.transfer_time_by_direction_s),
             "io_errors": self.io_errors,
             "cpu_pinned_capacity_bytes": (
                 self.config.num_cpu_kvcache_blocks * self.kv_block_bytes
@@ -338,9 +374,12 @@ class ModelRunner:
         }
 
     def reset_cache_stats(self):
+        if self.remote_kv_cache is not None:
+            self.remote_kv_cache.client.clear()
         self.transfer_counts.clear()
         self.transfer_bytes.clear()
         self.transfer_time_s = 0.0
+        self.transfer_time_by_direction_s.clear()
         self.io_errors = 0
         torch.cuda.reset_peak_memory_stats()
 
@@ -419,7 +458,7 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            return self.model(input_ids, positions)
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -433,13 +472,21 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            return graph_vars["outputs"][:bs]
 
-    def run(self, seqs: list[Sequence], is_prefill: bool, blocks_to_swap_in=None, blocks_to_swap_out=None) -> list[int]:
-        self.swap_blocks(blocks_to_swap_in or [], blocks_to_swap_out or [])
+    @torch.inference_mode()
+    def run(self, seqs: list[Sequence], is_prefill: bool, blocks_to_swap_in=None, blocks_to_swap_out=None, trace_seq_id=None, trace_output_token=None, replay_targets=None):
+        # Swaps are performed and committed by Scheduler before this call.
+        if blocks_to_swap_in or blocks_to_swap_out:
+            raise RuntimeError("Uncommitted KV transfers reached model execution")
 
         if not seqs:
-            return []
+            return [], None, None, None
+        if any(
+            tier != CacheTier.GPU
+            for seq in seqs for tier in seq.block_tiers
+        ):
+            raise RuntimeError("Attention requires all scheduled KV blocks on GPU")
 
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs)
@@ -447,14 +494,70 @@ class ModelRunner:
             input_ids, positions = self.prepare_decode(seqs)
 
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = (
-            self.sampler(logits, temperatures).tolist()
-            if self.rank == 0
-            else None
-        )
+        hidden_states = self.run_model(input_ids, positions, is_prefill)
+        if self.config.kv_fp32_greedy_rerank:
+            sample_hidden = (
+                hidden_states[get_context().cu_seqlens_q[1:] - 1]
+                if is_prefill else hidden_states
+            )
+            logits = F.linear(
+                sample_hidden.float(), self.fp32_lm_head_weight
+            )
+        else:
+            logits = self.model.compute_logits(hidden_states)
+        trace = None
+        if self.rank == 0 and trace_seq_id is not None:
+            for index, seq in enumerate(seqs):
+                emits_token = (
+                    not is_prefill or
+                    seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens
+                )
+                if (seq.seq_id == trace_seq_id
+                        and seq.num_completion_tokens == trace_output_token
+                        and emits_token):
+                    trace = logits[index].float().cpu().tolist()
+                    break
+        greedy_margins = None
+        replay_rows = None
+        if self.rank == 0:
+            if all(seq.temperature == 0 for seq in seqs):
+                token_ids = logits.argmax(dim=-1).tolist()
+                if self.config.kv_record_logit_margins:
+                    top_two = logits.float().topk(2, dim=-1).values
+                    greedy_margins = (top_two[:, 0] - top_two[:, 1]).tolist()
+            else:
+                token_ids = self.sampler(logits, temperatures).tolist()
+            if replay_targets is not None:
+                replay_rows = []
+                top_values, top_indices = logits.max(dim=-1)
+                for index, seq in enumerate(seqs):
+                    emits_token = (
+                        not is_prefill or
+                        seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens
+                    )
+                    if not emits_token:
+                        continue
+                    if seq.seq_id not in replay_targets:
+                        raise RuntimeError("Missing replay token for scheduled sequence")
+                    reference_id = replay_targets[seq.seq_id]
+                    if reference_id >= logits.size(-1):
+                        raise ValueError("Replay token ID exceeds model vocabulary")
+                    reference_logit = float(logits[index, reference_id].item())
+                    top_logit = float(top_values[index].item())
+                    replay_rows.append({
+                        "seq_id": seq.seq_id,
+                        "token_index": seq.num_completion_tokens,
+                        "reference_id": reference_id,
+                        "top_id": int(top_indices[index].item()),
+                        "reference_logit": reference_logit,
+                        "top_logit": top_logit,
+                        "gap": top_logit - reference_logit,
+                    })
+                    token_ids[index] = reference_id
+        else:
+            token_ids = None
         reset_context()
-        return token_ids
+        return token_ids, greedy_margins, trace, replay_rows
 
     @torch.inference_mode()
     def capture_cudagraph(self):

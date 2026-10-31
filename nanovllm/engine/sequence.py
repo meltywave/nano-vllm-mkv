@@ -37,6 +37,7 @@ class Sequence:
         self.is_prefill = True
         self.block_table = []
         self.block_table_tier = CacheTier.GPU
+        self.block_tiers = []
         self.last_used_step = -1
         self.num_swaps = 0
         self.temperature = sampling_params.temperature
@@ -91,6 +92,7 @@ class Sequence:
             self.num_scheduled_tokens,
             self.block_table,
             self.block_table_tier,
+            self.block_tiers,
             self.last_used_step,
             self.num_swaps,
             last_state,
@@ -104,6 +106,7 @@ class Sequence:
             self.num_scheduled_tokens,
             self.block_table,
             self.block_table_tier,
+            self.block_tiers,
             self.last_used_step,
             self.num_swaps,
             last_state,

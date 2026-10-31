@@ -45,7 +45,9 @@ class Config:
     remote_kvcache_host: str = "127.0.0.1"
     remote_kvcache_port: int = 19090
     remote_kvcache_timeout: float = 30.0
+    remote_kvcache_namespace: str | None = None
     kv_swap_policy: str = "waterfall_lru"
+    kv_placement: str = "sequence"
     kv_high_watermarks: dict[str, float] = field(
         default_factory=_default_high_watermarks
     )
@@ -54,6 +56,11 @@ class Config:
     )
     kv_max_transfer_blocks: int = -1
     kv_enable_prefix_cache: bool = True
+    kv_record_logit_margins: bool = False
+    kv_fp32_greedy_rerank: bool = False
+    kv_verify_transfers: bool = False
+    kv_trace_logits_request: int = -1
+    kv_trace_logits_token: int = -1
     kv_cache_tiers: tuple[str, ...] = field(init=False)
     ssd_cache_id: str = field(init=False, repr=False)
 
@@ -66,12 +73,22 @@ class Config:
             raise ValueError("kvcache_block_size must be a positive multiple of 256")
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError("tensor_parallel_size must be between 1 and 8")
+        if self.cache_engine > 1 and self.tensor_parallel_size > 1:
+            raise ValueError("multi-tier swapping currently requires tensor_parallel_size=1")
+        if self.kv_fp32_greedy_rerank and self.tensor_parallel_size > 1:
+            raise ValueError("FP32 greedy reranking currently requires tensor_parallel_size=1")
         if not 0 < self.gpu_memory_utilization <= 1:
             raise ValueError("gpu_memory_utilization must be in (0, 1]")
         if self.kv_swap_policy != "waterfall_lru":
             raise ValueError("Only kv_swap_policy='waterfall_lru' is supported")
+        if self.kv_placement not in {"sequence", "block-hot"}:
+            raise ValueError("kv_placement must be 'sequence' or 'block-hot'")
         if self.kv_max_transfer_blocks == 0 or self.kv_max_transfer_blocks < -1:
             raise ValueError("kv_max_transfer_blocks must be -1 or positive")
+        if (self.kv_trace_logits_request == -1) != (self.kv_trace_logits_token == -1):
+            raise ValueError("KV logit trace requires both request and token indices")
+        if self.kv_trace_logits_request < -1 or self.kv_trace_logits_token < -1:
+            raise ValueError("KV logit trace indices must be non-negative")
 
         self.kv_cache_tiers = ENGINE_TIERS[self.cache_engine]
         for tier in self.kv_cache_tiers:
@@ -104,6 +121,10 @@ class Config:
             raise ValueError("remote_kvcache_port must be between 1 and 65535")
         if self.remote_kvcache_timeout <= 0:
             raise ValueError("remote_kvcache_timeout must be positive")
+        if self.remote_kvcache_namespace is not None and (
+            not self.remote_kvcache_namespace or "/" in self.remote_kvcache_namespace
+        ):
+            raise ValueError("remote_kvcache_namespace must be nonempty without slashes")
         if self.ssd_kvcache_path is None:
             self.ssd_kvcache_path = tempfile.gettempdir()
         self.ssd_kvcache_path = os.path.abspath(
@@ -114,6 +135,15 @@ class Config:
 
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+        if (
+            self.cache_engine > 1
+            and self.kv_max_transfer_blocks != -1
+            and self.kv_max_transfer_blocks
+            < (self.max_model_len + self.kvcache_block_size - 1) // self.kvcache_block_size
+        ):
+            raise ValueError(
+                "kv_max_transfer_blocks must cover a whole maximum-length request"
+            )
 
     def watermarks(self, tier: str) -> tuple[float, float]:
         return self.kv_high_watermarks[tier], self.kv_low_watermarks[tier]
